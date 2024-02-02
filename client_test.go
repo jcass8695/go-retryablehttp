@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRequest(t *testing.T) {
@@ -1036,4 +1037,128 @@ func TestClient_RedirectWithBody(t *testing.T) {
 	if atomic.LoadInt32(&redirects) != 2 {
 		t.Fatalf("Expected the client to be redirected 2 times, got: %d", atomic.LoadInt32(&redirects))
 	}
+}
+
+type mockLeveledLogger struct {
+	gotCalls []mockLeveledLoggerCall
+}
+
+type mockLeveledLoggerCall struct {
+	msg       string
+	keyValues []interface{}
+}
+
+func (l *mockLeveledLogger) Debug(msg string, keyValuePairs ...interface{}) {
+	l.gotCalls = append(l.gotCalls, mockLeveledLoggerCall{msg, keyValuePairs})
+}
+
+func (l *mockLeveledLogger) Info(msg string, keyValuePairs ...interface{}) {
+	l.gotCalls = append(l.gotCalls, mockLeveledLoggerCall{msg, keyValuePairs})
+}
+
+func (l *mockLeveledLogger) Warn(msg string, keyValuePairs ...interface{}) {
+	l.gotCalls = append(l.gotCalls, mockLeveledLoggerCall{msg, keyValuePairs})
+}
+
+func (l *mockLeveledLogger) Error(msg string, keyValuePairs ...interface{}) {
+	l.gotCalls = append(l.gotCalls, mockLeveledLoggerCall{msg, keyValuePairs})
+}
+
+func TestClient_LoggerKeyValuesFromRequestContext(t *testing.T) {
+	type logKeyValuesCtxKey struct{}
+
+	type testcase struct {
+		name                     string
+		testServer               *httptest.Server
+		clientTimeout            time.Duration
+		clientMaxRetries         int
+		testServerHTTPStatusCode int
+		testServerError          bool
+		wantLoggerCalls          []mockLeveledLoggerCall
+	}
+
+	tests := []testcase{
+		{
+			name: "should make default calls to logger with request context key values on successfull request",
+			testServer: httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})),
+			clientTimeout: 10 * time.Second,
+			wantLoggerCalls: []mockLeveledLoggerCall{
+				{
+					msg: "performing request",
+				},
+			},
+		},
+		{
+			name: "should make error calls to logger with request context key values on a failed non-retryable request",
+			testServer: httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(time.Second) // Simulate timeout
+				w.WriteHeader(http.StatusOK)
+			})),
+			clientTimeout: 500 * time.Millisecond,
+			wantLoggerCalls: []mockLeveledLoggerCall{
+				{
+					msg: "performing request",
+				},
+				{
+					msg: "request failed",
+				},
+			},
+		},
+		{
+			name:             "should make calls to logger with request context key values on a failed retryable request",
+			clientMaxRetries: 1,
+			testServer: httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			})),
+			clientTimeout: 10 * time.Second,
+			wantLoggerCalls: []mockLeveledLoggerCall{
+				{
+					msg: "performing request",
+				},
+				{
+					msg: "retrying request",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.testServer.Start()
+			t.Cleanup(test.testServer.Close)
+
+			req, err := NewRequest(http.MethodGet, test.testServer.URL, nil)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+
+			ctx := req.Context()
+			*req = *req.WithContext(context.WithValue(ctx, logKeyValuesCtxKey{}, []string{"foo", "bar"}))
+
+			mockLogger := &mockLeveledLogger{}
+			client := NewClient()
+			client.LoggerKeyValuesFromRequestContext = func(ctx context.Context) []interface{} {
+				return []interface{}{ctx.Value(logKeyValuesCtxKey{})}
+			}
+			client.HTTPClient.Timeout = test.clientTimeout
+			client.RetryMax = test.clientMaxRetries
+			client.RetryWaitMax = time.Millisecond
+			client.Logger = LeveledLogger(mockLogger)
+
+			_, _ = client.Do(req)
+			if len(mockLogger.gotCalls) != len(test.wantLoggerCalls) {
+				t.Fatalf("wanted %d logger calls but got %d", len(test.wantLoggerCalls), len(mockLogger.gotCalls))
+			}
+
+			for i, want := range test.wantLoggerCalls {
+				got := mockLogger.gotCalls[i]
+
+				assert.Equal(t, want.msg, got.msg, "wanted log message %s but got %s", want.msg, got.msg)
+				assert.Containsf(t, got.keyValues, []string{"foo", "bar"}, "wanted 'foo, bar' in log key-values but got %s", got.keyValues)
+			}
+		})
+	}
+
 }

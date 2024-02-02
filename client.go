@@ -55,6 +55,8 @@ var (
 	// defaultLogger is the logger provided with defaultClient
 	defaultLogger = log.New(os.Stderr, "", log.LstdFlags)
 
+	defaultLogKeyValuesFromContext = func(_ context.Context) []interface{} { return []interface{}{} }
+
 	// defaultClient is used for performing requests without explicitly making
 	// a new client. It is purposely private to avoid modifications.
 	defaultClient = NewClient()
@@ -372,6 +374,10 @@ type RequestLogHook func(Logger, *http.Request, int)
 // from this method, this will affect the response returned from Do().
 type ResponseLogHook func(Logger, *http.Response)
 
+// LoggerKeyValuesFromRequestContext can be used to extract key-values from the request context and add them to each log
+// call.
+type LoggerKeyValuesFromRequestContext func(context.Context) []interface{}
+
 // CheckRetry specifies a policy for handling retries. It is called
 // following each request with the response and error values returned by
 // the http.Client. If CheckRetry returns false, the Client stops retrying
@@ -411,6 +417,8 @@ type Client struct {
 	// with the response from each HTTP request executed.
 	ResponseLogHook ResponseLogHook
 
+	LoggerKeyValuesFromRequestContext LoggerKeyValuesFromRequestContext
+
 	// CheckRetry specifies the policy for handling retries, and is called
 	// after each request. The default policy is DefaultRetryPolicy.
 	CheckRetry CheckRetry
@@ -428,13 +436,14 @@ type Client struct {
 // NewClient creates a new Client with default settings.
 func NewClient() *Client {
 	return &Client{
-		HTTPClient:   cleanhttp.DefaultPooledClient(),
-		Logger:       defaultLogger,
-		RetryWaitMin: defaultRetryWaitMin,
-		RetryWaitMax: defaultRetryWaitMax,
-		RetryMax:     defaultRetryMax,
-		CheckRetry:   DefaultRetryPolicy,
-		Backoff:      DefaultBackoff,
+		HTTPClient:                        cleanhttp.DefaultPooledClient(),
+		Logger:                            defaultLogger,
+		LoggerKeyValuesFromRequestContext: defaultLogKeyValuesFromContext,
+		RetryWaitMin:                      defaultRetryWaitMin,
+		RetryWaitMax:                      defaultRetryWaitMax,
+		RetryMax:                          defaultRetryMax,
+		CheckRetry:                        DefaultRetryPolicy,
+		Backoff:                           DefaultBackoff,
 	}
 }
 
@@ -449,7 +458,10 @@ func (c *Client) logger() interface{} {
 			// ok
 		default:
 			// This should happen in dev when they are setting Logger and work on code, not in prod.
-			panic(fmt.Sprintf("invalid logger type passed, must be Logger or LeveledLogger, was %T", c.Logger))
+			panic(fmt.Sprintf(
+				"invalid logger type passed, must be Logger, LeveledLogger or LeveledLoggerWithRequestContext, was %T",
+				c.Logger,
+			))
 		}
 	})
 
@@ -609,7 +621,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 	if logger != nil {
 		switch v := logger.(type) {
 		case LeveledLogger:
-			v.Debug("performing request", "method", req.Method, "url", req.URL)
+			v.Debug("performing request", append(c.LoggerKeyValuesFromRequestContext(req.Context()), "method", req.Method, "url", req.URL)...)
 		case Logger:
 			v.Printf("[DEBUG] %s %s", req.Method, req.URL)
 		}
@@ -666,7 +678,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 		if err != nil {
 			switch v := logger.(type) {
 			case LeveledLogger:
-				v.Error("request failed", "error", err, "method", req.Method, "url", req.URL)
+				v.Error("request failed", append(c.LoggerKeyValuesFromRequestContext(req.Context()), "error", err, "method", req.Method, "url", req.URL)...)
 			case Logger:
 				v.Printf("[ERR] %s %s request failed: %v", req.Method, req.URL, err)
 			}
@@ -699,7 +711,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 
 		// We're going to retry, consume any response to reuse the connection.
 		if doErr == nil {
-			c.drainBody(resp.Body)
+			c.drainBody(req.Context(), resp.Body)
 		}
 
 		wait := c.Backoff(c.RetryWaitMin, c.RetryWaitMax, i, resp)
@@ -710,7 +722,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 			}
 			switch v := logger.(type) {
 			case LeveledLogger:
-				v.Debug("retrying request", "request", desc, "timeout", wait, "remaining", remain)
+				v.Debug("retrying request", append(c.LoggerKeyValuesFromRequestContext(req.Context()), "request", desc, "timeout", wait, "remaining", remain)...)
 			case Logger:
 				v.Printf("[DEBUG] %s: retrying in %s (%d left)", desc, wait, remain)
 			}
@@ -753,7 +765,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 	// By default, we close the response body and return an error without
 	// returning the response
 	if resp != nil {
-		c.drainBody(resp.Body)
+		c.drainBody(req.Context(), resp.Body)
 	}
 
 	// this means CheckRetry thought the request was a failure, but didn't
@@ -768,14 +780,14 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 }
 
 // Try to read the response body so we can reuse this connection.
-func (c *Client) drainBody(body io.ReadCloser) {
+func (c *Client) drainBody(ctx context.Context, body io.ReadCloser) {
 	defer body.Close()
 	_, err := io.Copy(ioutil.Discard, io.LimitReader(body, respReadLimit))
 	if err != nil {
 		if c.logger() != nil {
 			switch v := c.logger().(type) {
 			case LeveledLogger:
-				v.Error("error reading response body", "error", err)
+				v.Error("error reading response body", append(c.LoggerKeyValuesFromRequestContext(ctx), "error", err)...)
 			case Logger:
 				v.Printf("[ERR] error reading response body: %v", err)
 			}
